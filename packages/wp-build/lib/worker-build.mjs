@@ -8,10 +8,9 @@
  */
 import { readFile, writeFile, access } from 'fs/promises';
 import path from 'path';
-import esbuild from 'esbuild';
 
 /**
- * Creates an esbuild plugin that redirects module loads based on filename patterns.
+ * Creates a Rolldown plugin that redirects module loads based on filename patterns.
  *
  * This is useful when bundling workers for Blob URL contexts where certain
  * ES module entry points use `import.meta.url` (which resolves to an invalid
@@ -30,11 +29,11 @@ import esbuild from 'esbuild';
  *   }
  *
  * @param {Object} resolveMap An object mapping source filenames to target
- *                            filenames. When esbuild loads a file whose path
+ *                            filenames. When Rolldown loads a file whose path
  *                            ends with a source key, the plugin rewrites it
  *                            to re-export from the corresponding target file
  *                            in the same directory.
- * @return {Object} An esbuild plugin.
+ * @return {import('rolldown').Plugin} A Rolldown plugin.
  */
 function createModuleRedirectPlugin( resolveMap ) {
 	// Build a single regex that matches any of the source filenames.
@@ -45,32 +44,31 @@ function createModuleRedirectPlugin( resolveMap ) {
 
 	return {
 		name: 'module-redirect',
-		setup( build ) {
-			build.onLoad( { filter: pattern }, ( args ) => {
+		load: {
+			filter: { id: pattern },
+			handler( id ) {
 				// Find which key matched.
 				const matchedKey = Object.keys( resolveMap ).find( ( key ) =>
-					args.path.endsWith( key )
+					id.endsWith( key )
 				);
-				const targetPath = args.path.replace(
+				const targetPath = id.replace(
 					matchedKey,
 					resolveMap[ matchedKey ]
 				);
-				const resolveDir = path.dirname( args.path );
 				// A relative specifier keeps the checkout path out of the source map.
 				const specifier =
 					'./' +
 					path
-						.relative( resolveDir, targetPath )
+						.relative( path.dirname( id ), targetPath )
 						.split( path.sep )
 						.join( '/' );
 				return {
-					contents: `export { default } from ${ JSON.stringify(
+					code: `export { default } from ${ JSON.stringify(
 						specifier
 					) };`,
-					loader: 'js',
-					resolveDir,
+					moduleType: 'js',
 				};
-			} );
+			},
 		},
 	};
 }
@@ -145,18 +143,17 @@ export const workerCode = '/* Placeholder - run npm run build to generate actual
  *
  * Workers are bundled as self-contained files with all dependencies included.
  *
- * @param {string}   packageDir               Path to the package directory.
- * @param {Object}   packageJson              Parsed package.json contents.
- * @param {Object}   options                  Build options.
- * @param {string}   options.buildDir         Path to the CJS build directory.
- * @param {string}   options.buildModuleDir   Path to the ESM build-module directory.
- * @param {string[]} options.target           esbuild target configuration.
- * @param {Object}   options.wasmInlinePlugin The WASM inline plugin for esbuild.
+ * @param {string}                                                                                                                                                 packageDir             Path to the package directory.
+ * @param {Object}                                                                                                                                                 packageJson            Parsed package.json contents.
+ * @param {Object}                                                                                                                                                 options                Build options.
+ * @param {string}                                                                                                                                                 options.buildDir       Path to the CJS build directory.
+ * @param {string}                                                                                                                                                 options.buildModuleDir Path to the ESM build-module directory.
+ * @param {(options: {entry: string, outfile: string, format: 'esm'|'cjs', platform: 'browser'|'node', plugins: import('rolldown').Plugin[]}) => Promise<unknown>} options.bundle         Bundles an entry point to a file.
  */
 export async function buildWorkers(
 	packageDir,
 	packageJson,
-	{ buildDir, buildModuleDir, target, wasmInlinePlugin }
+	{ buildDir, buildModuleDir, bundle }
 ) {
 	if ( ! packageJson.wpWorkers ) {
 		return;
@@ -176,35 +173,20 @@ export async function buildWorkers(
 		const workerOutputName = outputName.replace( /^\.\//, '' );
 
 		// Build ESM worker for build-module (primary for browser use).
+		// Bundle everything - workers need to be self-contained.
 		if ( packageJson.module ) {
 			workerBuilds.push(
-				esbuild.build( {
-					entryPoints: [ workerEntryPoint ],
+				bundle( {
+					entry: workerEntryPoint,
 					outfile: path.join(
 						buildModuleDir,
 						`${ workerOutputName }.mjs`
 					),
-					bundle: true,
-					// Emit UTF-8 so binary-encoded inlined WASM stays compact
-					// (ASCII output would escape high bytes as \uXXXX).
-					charset: 'utf8',
 					format: 'esm',
 					platform: 'browser',
-					target,
-					sourcemap: true,
-					// Bundle everything - workers need to be self-contained.
-					external: [],
-					plugins: [
-						wasmInlinePlugin,
-						...( resolveMap
-							? [ createModuleRedirectPlugin( resolveMap ) ]
-							: [] ),
-					],
-					define: {
-						'process.env.NODE_ENV': JSON.stringify(
-							process.env.NODE_ENV || 'production'
-						),
-					},
+					plugins: resolveMap
+						? [ createModuleRedirectPlugin( resolveMap ) ]
+						: [],
 				} )
 			);
 		}
@@ -220,24 +202,12 @@ export async function buildWorkers(
 		// unused or misleading CJS artifacts.
 		if ( packageJson.main ) {
 			workerBuilds.push(
-				esbuild.build( {
-					entryPoints: [ workerEntryPoint ],
+				bundle( {
+					entry: workerEntryPoint,
 					outfile: path.join( buildDir, `${ workerOutputName }.cjs` ),
-					bundle: true,
-					// Emit UTF-8 so binary-encoded inlined WASM stays compact
-					// (ASCII output would escape high bytes as \uXXXX).
-					charset: 'utf8',
 					format: 'cjs',
 					platform: 'node',
-					target,
-					sourcemap: true,
-					external: [],
-					plugins: [ wasmInlinePlugin ],
-					define: {
-						'process.env.NODE_ENV': JSON.stringify(
-							process.env.NODE_ENV || 'production'
-						),
-					},
+					plugins: [],
 				} )
 			);
 		}
@@ -252,26 +222,23 @@ export async function buildWorkers(
  * Creates worker-code.ts with bundled content for Blob URL loading,
  * then re-transpiles it to the output directories.
  *
- * @param {string}   packageDir             Path to the package directory.
- * @param {string}   packageName            Name of the package.
- * @param {Object}   packageJson            Parsed package.json contents.
- * @param {Object}   options                Build options.
- * @param {string}   options.srcDir         Path to the source directory.
- * @param {string}   options.buildDir       Path to the CJS build directory.
- * @param {string}   options.buildModuleDir Path to the ESM build-module directory.
- * @param {string[]} options.target         esbuild target configuration.
- * @param {Array}    options.plugins        esbuild plugins for transpilation.
+ * @param {string}                                packageDir        Path to the package directory.
+ * @param {string}                                packageName       Name of the package.
+ * @param {Object}                                packageJson       Parsed package.json contents.
+ * @param {Object}                                options           Build options.
+ * @param {(files: string[]) => Promise<unknown>} options.transpile Transpiles the given source files to the package's output directories.
  */
 export async function generateWorkerCode(
 	packageDir,
 	packageName,
 	packageJson,
-	{ srcDir, buildDir, buildModuleDir, target, plugins }
+	{ transpile }
 ) {
 	if ( ! packageJson.wpWorkers ) {
 		return;
 	}
 
+	const buildModuleDir = path.join( packageDir, 'build-module' );
 	const workerEntries =
 		typeof packageJson.wpWorkers === 'object' &&
 		packageJson.wpWorkers !== null
@@ -322,52 +289,5 @@ export const workerCode = ${ JSON.stringify( workerContent ) };
 	// the real bundled worker code, re-transpile it so that
 	// build-module/worker-code.mjs (and build/worker-code.cjs if applicable)
 	// reflect the actual worker code in a single build run.
-	const workerCodeSrcFile = path.join( packageDir, 'src', 'worker-code.ts' );
-	const retranspileBuilds = [];
-
-	if ( packageJson.module ) {
-		retranspileBuilds.push(
-			esbuild.build( {
-				entryPoints: [ workerCodeSrcFile ],
-				outdir: buildModuleDir,
-				outbase: srcDir,
-				outExtension: { '.js': '.mjs' },
-				bundle: true,
-				// Emit UTF-8 so binary-encoded inlined WASM stays compact
-				// (ASCII output would escape high bytes as \uXXXX).
-				charset: 'utf8',
-				platform: 'neutral',
-				format: 'esm',
-				sourcemap: true,
-				target,
-				jsx: 'automatic',
-				jsxImportSource: 'react',
-				plugins,
-			} )
-		);
-	}
-
-	if ( packageJson.main ) {
-		retranspileBuilds.push(
-			esbuild.build( {
-				entryPoints: [ workerCodeSrcFile ],
-				outdir: buildDir,
-				outbase: srcDir,
-				outExtension: { '.js': '.cjs' },
-				bundle: true,
-				// Emit UTF-8 so binary-encoded inlined WASM stays compact
-				// (ASCII output would escape high bytes as \uXXXX).
-				charset: 'utf8',
-				platform: 'node',
-				format: 'cjs',
-				sourcemap: true,
-				target,
-				jsx: 'automatic',
-				jsxImportSource: 'react',
-				plugins,
-			} )
-		);
-	}
-
-	await Promise.all( retranspileBuilds );
+	await transpile( [ path.join( packageDir, 'src', 'worker-code.ts' ) ] );
 }

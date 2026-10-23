@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Internal
+
+-   Bundle and transpile with Rolldown instead of esbuild. Inlined helpers shared by several transpiled files, like the style runtime of CSS modules, are emitted once per package in `build/_chunks/` and `build-module/_chunks/`, instead of being copied into every file.
+
 ## 0.26.0 (2026-10-20)
 
 ### Breaking Changes
